@@ -5,16 +5,16 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Direct HTTPS MP4 URL"
+        description: "YouTube video URL"
         required: true
         type: string
       clip_count:
-        description: "Number of clips to create"
+        description: "Number of clips (1-5)"
         required: true
         default: "2"
         type: string
       clip_duration:
-        description: "Duration of each clip in seconds"
+        description: "Clip duration in seconds (15-60)"
         required: true
         default: "30"
         type: string
@@ -28,59 +28,35 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Download source video
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pip
+          python -m pip install --break-system-packages yt-dlp
+
+      - name: Download YouTube video
         env:
           VIDEO_URL: ${{ inputs.video_url }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os
-          import urllib.parse
-          import urllib.request
+          python -m yt_dlp \
+            --no-playlist \
+            --max-filesize 1G \
+            -f "bv*[height<=1080]+ba/b[height<=1080]" \
+            --merge-output-format mp4 \
+            -o "source.%(ext)s" \
+            "$VIDEO_URL"
 
-          url = os.environ["VIDEO_URL"]
-          parsed = urllib.parse.urlparse(url)
+          SOURCE=$(find . -maxdepth 1 -type f \
+            -name 'source.*' \
+            ! -name '*.part' | head -n 1)
 
-          if parsed.scheme != "https":
-              raise SystemExit("Only HTTPS video URLs are allowed.")
+          if [ -z "$SOURCE" ]; then
+            echo "Video download failed."
+            exit 1
+          fi
 
-          if not parsed.path.lower().endswith((".mp4", ".m4v", ".mov")):
-              raise SystemExit(
-                  "URL must point directly to an MP4, M4V, or MOV file."
-              )
-
-          request = urllib.request.Request(
-              url, headers={"User-Agent": "ClipForge/1.0"}
-          )
-
-          with urllib.request.urlopen(request, timeout=60) as response:
-              content_type = response.headers.get("Content-Type", "")
-              if "video" not in content_type.lower() and \
-                 "octet-stream" not in content_type.lower():
-                  raise SystemExit(
-                      "URL did not return a video file. "
-                      f"Content-Type: {content_type}"
-                  )
-
-              with open("source.mp4", "wb") as output:
-                  total = 0
-                  while True:
-                      chunk = response.read(1024 * 1024)
-                      if not chunk:
-                          break
-                      total += len(chunk)
-                      if total > 1_500_000_000:
-                          raise SystemExit("Video exceeds 1.5 GB limit.")
-                      output.write(chunk)
-
-          if os.path.getsize("source.mp4") == 0:
-              raise SystemExit("Downloaded video is empty.")
-          PY
-
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          mv "$SOURCE" source.mp4
 
       - name: Create vertical clips
         env:
@@ -89,49 +65,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          COUNT="$CLIP_COUNT"
-          DURATION="$CLIP_DURATION"
-
-          [[ "$COUNT" =~ ^[1-5]$ ]] || {
-            echo "Clip count must be between 1 and 5."
+          [[ "$CLIP_COUNT" =~ ^[1-5]$ ]] || {
+            echo "Clip count must be 1-5."
             exit 1
           }
 
-          [[ "$DURATION" =~ ^[15-9][0-9]$|^1[0-2][0-9]$|^130$ ]] || {
-            echo "Clip duration must be 15 to 130 seconds."
+          [[ "$CLIP_DURATION" =~ ^(15|[1-5][0-9]|60)$ ]] || {
+            echo "Clip duration must be 15-60 seconds."
             exit 1
           }
 
           mkdir -p clips
 
-          VIDEO_DURATION=$(ffprobe -v error \
+          TOTAL=$(ffprobe -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 source.mp4)
 
-          python -c 'import sys; assert float(sys.argv[1]) > 0' "$VIDEO_DURATION"
+          python -c 'import sys; assert float(sys.argv[1]) > 0' "$TOTAL"
 
-          for i in $(seq 1 "$COUNT"); do
-            START=$(python - "$VIDEO_DURATION" "$DURATION" "$i" "$COUNT" <<'PY'
+          for i in $(seq 1 "$CLIP_COUNT"); do
+            START=$(python - "$TOTAL" "$CLIP_DURATION" "$i" "$CLIP_COUNT" <<'PY'
           import sys
           total, length, index, count = map(float, sys.argv[1:])
           available = max(0, total - length)
-          print(max(0, available * (index - 1) / max(1, count - 1)))
+          print(available * (index - 1) / max(1, count - 1))
           PY
           )
 
             ffmpeg -hide_banner -loglevel error -y \
               -ss "$START" -i source.mp4 \
-              -t "$DURATION" \
+              -t "$CLIP_DURATION" \
               -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
-              -an \
-              -c:v libx264 -preset ultrafast -crf 24 \
+              -an -c:v libx264 -preset ultrafast -crf 24 \
               -pix_fmt yuv420p \
               "clips/clip-${i}.mp4"
 
             test -s "clips/clip-${i}.mp4"
           done
 
-      - name: Upload clips as downloadable artifacts
+      - name: Upload clips as artifacts
         uses: actions/upload-artifact@v4
         with:
           name: clipforge-clips
