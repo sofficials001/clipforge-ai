@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "YouTube video URL you are authorized to edit"
+        description: "YouTube video URL you have permission to edit"
         required: true
         type: string
       clip_count:
@@ -14,7 +14,7 @@ on:
         default: "2"
         type: string
       clip_duration:
-        description: "Duration per clip in seconds (15-60)"
+        description: "Clip duration in seconds (15-60)"
         required: true
         default: "30"
         type: string
@@ -32,17 +32,18 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl unzip
+          sudo apt-get install -y ffmpeg curl
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.deno/bin:$PATH"
-          python -m pip install --break-system-packages "yt-dlp[default]"
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade "yt-dlp[default]"
 
-      - name: Validate YouTube URL
+      - name: Validate URL
         env:
           VIDEO_URL: ${{ inputs.video_url }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import os
           from urllib.parse import urlparse
 
@@ -60,64 +61,64 @@ jobs:
 
           if parsed.scheme != "https" or host not in allowed:
               raise SystemExit(
-                  "Enter a normal HTTPS URL from youtube.com or youtu.be."
+                  "Enter an HTTPS YouTube URL or youtu.be link."
               )
 
           if not parsed.path or parsed.path == "/":
               raise SystemExit("The URL does not identify a video.")
 
-          print("YouTube URL format accepted.")
+          print("URL format accepted.")
           PY
 
-      - name: Download YouTube video
+      - name: Download authorized video
         env:
           VIDEO_URL: ${{ inputs.video_url }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.deno/bin:$PATH"
 
-          yt-dlp \
+          if ! .venv/bin/yt-dlp \
             --no-playlist \
             --max-filesize 1G \
             --js-runtimes deno \
-            -f "bv*[height<=1080]+ba/b[height<=1080]" \
+            --format "bv*[height<=1080]+ba/b[height<=1080]" \
             --merge-output-format mp4 \
-            -o "download.%(ext)s" \
-            "$VIDEO_URL" || {
-              echo "::error::Download failed. YouTube may require authentication or may be temporarily blocking automated downloads. This workflow does not bypass sign-in restrictions."
+            --recode-video mp4 \
+            --output "source.%(ext)s" \
+            "$VIDEO_URL"; then
+              echo "::error::YouTube download failed. YouTube may require sign-in or block automated downloads. No cookies or login bypasses are used. Ask the owner for an authorized MP4 file or direct download link."
               exit 1
-            }
+          fi
 
           SOURCE=$(find . -maxdepth 1 -type f \
-            -name 'download.*' ! -name '*.part' \
-            ! -name '*.json' -print -quit)
+            -name 'source.mp4' -print -quit)
 
           if [ -z "$SOURCE" ] || [ ! -s "$SOURCE" ]; then
-            echo "::error::No downloaded video file was found."
+            echo "::error::The downloaded MP4 was not found."
             exit 1
           fi
 
-          mv "$SOURCE" source.mp4
-
-          ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 source.mp4
+          mv "$SOURCE" input.mp4
 
       - name: Validate clip settings
         env:
           CLIP_COUNT: ${{ inputs.clip_count }}
           CLIP_DURATION: ${{ inputs.clip_duration }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import os
 
-          count = int(os.environ["CLIP_COUNT"])
-          duration = int(os.environ["CLIP_DURATION"])
+          try:
+              count = int(os.environ["CLIP_COUNT"])
+              duration = int(os.environ["CLIP_DURATION"])
+          except ValueError:
+              raise SystemExit("Clip count and duration must be numbers.")
 
           if not 1 <= count <= 5:
-              raise SystemExit("Choose between 1 and 5 clips.")
+              raise SystemExit("Clip count must be from 1 to 5.")
 
           if not 15 <= duration <= 60:
-              raise SystemExit("Choose a duration between 15 and 60 seconds.")
+              raise SystemExit("Clip duration must be from 15 to 60 seconds.")
           PY
 
       - name: Create vertical clips
@@ -130,20 +131,19 @@ jobs:
 
           TOTAL=$(ffprobe -v error \
             -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 source.mp4)
+            -of default=noprint_wrappers=1:nokey=1 input.mp4)
 
-          python - "$TOTAL" "$CLIP_DURATION" <<'PY'
+          python3 - "$TOTAL" "$CLIP_DURATION" <<'PY'
           import sys
-
           total, length = map(float, sys.argv[1:])
           if total < length:
               raise SystemExit(
-                  "The source video is shorter than the requested clip duration."
+                  "Source video is shorter than the requested clip duration."
               )
           PY
 
           for i in $(seq 1 "$CLIP_COUNT"); do
-            START=$(python - "$TOTAL" "$CLIP_DURATION" \
+            START=$(python3 - "$TOTAL" "$CLIP_DURATION" \
               "$i" "$CLIP_COUNT" <<'PY'
           import sys
           total, length, index, count = map(float, sys.argv[1:])
@@ -153,7 +153,7 @@ jobs:
           )
 
             ffmpeg -hide_banner -loglevel error -y \
-              -ss "$START" -i source.mp4 \
+              -ss "$START" -i input.mp4 \
               -t "$CLIP_DURATION" \
               -map 0:v:0 -map '0:a?' \
               -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
@@ -166,7 +166,7 @@ jobs:
             test -s "clips/clip-${i}.mp4"
           done
 
-      - name: Upload clips as artifacts
+      - name: Upload clips
         uses: actions/upload-artifact@v4
         with:
           name: clipforge-clips
