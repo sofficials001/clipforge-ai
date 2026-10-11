@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Direct HTTPS MP4 file URL"
+        description: "Direct MP4 or authorized Googlevideo playback URL"
         required: true
         type: string
       clip_count:
@@ -34,7 +34,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Download MP4 video
+      - name: Download MP4 source
         env:
           VIDEO_URL: ${{ inputs.video_url }}
         run: |
@@ -44,15 +44,38 @@ jobs:
           import os
           import urllib.parse
           import urllib.request
+          import urllib.error
 
           url = os.environ["VIDEO_URL"].strip()
           parsed = urllib.parse.urlparse(url)
+          host = (parsed.hostname or "").lower()
+          query = urllib.parse.parse_qs(parsed.query)
 
           if parsed.scheme != "https":
-              raise SystemExit("Only HTTPS URLs are allowed.")
+              raise SystemExit("Only HTTPS URLs are accepted.")
 
-          if not parsed.path.lower().endswith(".mp4"):
-              raise SystemExit("Please provide a direct URL ending in .mp4.")
+          is_googlevideo = (
+              host == "googlevideo.com"
+              or host.endswith(".googlevideo.com")
+          )
+
+          is_direct_mp4 = parsed.path.lower().endswith(".mp4")
+
+          if is_googlevideo:
+              if not parsed.path.endswith("/videoplayback"):
+                  raise SystemExit(
+                      "Googlevideo URL must use the videoplayback endpoint."
+                  )
+              mime = query.get("mime", [""])[0].lower()
+              if mime != "video/mp4":
+                  raise SystemExit(
+                      "Googlevideo URL must specify mime=video/mp4."
+                  )
+          elif not is_direct_mp4:
+              raise SystemExit(
+                  "Provide a direct .mp4 URL or a signed "
+                  "googlevideo.com/videoplayback URL for video/mp4."
+              )
 
           request = urllib.request.Request(
               url,
@@ -62,33 +85,72 @@ jobs:
           limit = 1_000_000_000
           total = 0
 
-          with urllib.request.urlopen(request, timeout=60) as response:
-              content_type = response.headers.get("Content-Type", "").lower()
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  final = urllib.parse.urlparse(response.geturl())
+                  final_host = (final.hostname or "").lower()
 
-              if "video" not in content_type and "octet-stream" not in content_type:
-                  raise SystemExit(
-                      "The URL did not return an MP4 video file. "
-                      f"Content-Type: {content_type}"
+                  final_is_googlevideo = (
+                      final_host == "googlevideo.com"
+                      or final_host.endswith(".googlevideo.com")
                   )
 
-              with open("source.mp4", "wb") as output:
-                  while True:
-                      chunk = response.read(1024 * 1024)
-                      if not chunk:
-                          break
+                  if final.scheme != "https":
+                      raise SystemExit("Video redirected to a non-HTTPS URL.")
 
-                      total += len(chunk)
-                      if total > limit:
-                          raise SystemExit("Maximum file size is 1 GB.")
+                  if not (
+                      final.path.lower().endswith(".mp4")
+                      or final_is_googlevideo
+                  ):
+                      raise SystemExit(
+                          "Video redirected to an unsupported host."
+                      )
 
-                      output.write(chunk)
+                  content_type = response.headers.get(
+                      "Content-Type", ""
+                  ).split(";")[0].strip().lower()
 
-          if not os.path.isfile("source.mp4") or os.path.getsize("source.mp4") == 0:
-              raise SystemExit("The downloaded file is empty.")
+                  if content_type not in ("video/mp4", "application/octet-stream"):
+                      raise SystemExit(
+                          "Server did not return MP4 data. "
+                          f"Content-Type: {content_type}"
+                      )
+
+                  length = response.headers.get("Content-Length")
+                  if length and int(length) > limit:
+                      raise SystemExit("Maximum download size is 1 GB.")
+
+                  with open("source.mp4", "wb") as output:
+                      while True:
+                          chunk = response.read(1024 * 1024)
+                          if not chunk:
+                              break
+
+                          total += len(chunk)
+                          if total > limit:
+                              raise SystemExit(
+                                  "Maximum download size is 1 GB."
+                              )
+
+                          output.write(chunk)
+
+          except urllib.error.HTTPError as exc:
+              if exc.code in (401, 403, 410):
+                  raise SystemExit(
+                      "The video URL was rejected or has expired. "
+                      "Obtain a fresh authorized link from the owner."
+                  )
+              raise SystemExit(f"Video download failed: HTTP {exc.code}")
+          except urllib.error.URLError as exc:
+              raise SystemExit(f"Video download failed: {exc.reason}")
+
+          if total == 0:
+              raise SystemExit("Downloaded file is empty.")
           PY
 
-          ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 source.mp4
+          ffprobe -v error -select_streams v:0 \
+            -show_entries stream=codec_type \
+            -of csv=p=0 source.mp4
 
       - name: Validate clip settings
         env:
@@ -108,7 +170,9 @@ jobs:
               raise SystemExit("Clip count must be between 1 and 5.")
 
           if not 15 <= duration <= 60:
-              raise SystemExit("Clip duration must be between 15 and 60 seconds.")
+              raise SystemExit(
+                  "Clip duration must be between 15 and 60 seconds."
+              )
           PY
 
       - name: Create vertical clips
@@ -127,7 +191,9 @@ jobs:
           import sys
           total, length = map(float, sys.argv[1:])
           if total < length:
-              raise SystemExit("Video is shorter than the requested clip duration.")
+              raise SystemExit(
+                  "Source video is shorter than the requested duration."
+              )
           PY
 
           for i in $(seq 1 "$CLIP_COUNT"); do
@@ -161,3 +227,4 @@ jobs:
           path: clips/*.mp4
           if-no-files-found: error
           retention-days: 3
+          
