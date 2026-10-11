@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "YouTube video URL"
+        description: "YouTube video URL you are authorized to edit"
         required: true
         type: string
       clip_count:
@@ -14,7 +14,7 @@ on:
         default: "2"
         type: string
       clip_duration:
-        description: "Clip duration in seconds (15-60)"
+        description: "Duration per clip in seconds (15-60)"
         required: true
         default: "30"
         type: string
@@ -30,33 +30,95 @@ jobs:
     steps:
       - name: Install tools
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip
-          python -m pip install --break-system-packages yt-dlp
+          sudo apt-get install -y ffmpeg curl unzip
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.deno/bin:$PATH"
+          python -m pip install --break-system-packages "yt-dlp[default]"
+
+      - name: Validate YouTube URL
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+
+          url = os.environ["VIDEO_URL"].strip()
+          parsed = urlparse(url)
+          host = (parsed.hostname or "").lower()
+
+          allowed = {
+              "youtube.com",
+              "www.youtube.com",
+              "m.youtube.com",
+              "youtu.be",
+              "www.youtu.be",
+          }
+
+          if parsed.scheme != "https" or host not in allowed:
+              raise SystemExit(
+                  "Enter a normal HTTPS URL from youtube.com or youtu.be."
+              )
+
+          if not parsed.path or parsed.path == "/":
+              raise SystemExit("The URL does not identify a video.")
+
+          print("YouTube URL format accepted.")
+          PY
 
       - name: Download YouTube video
         env:
           VIDEO_URL: ${{ inputs.video_url }}
         run: |
           set -euo pipefail
-          python -m yt_dlp \
+          export PATH="$HOME/.deno/bin:$PATH"
+
+          yt-dlp \
             --no-playlist \
             --max-filesize 1G \
+            --js-runtimes deno \
             -f "bv*[height<=1080]+ba/b[height<=1080]" \
             --merge-output-format mp4 \
-            -o "source.%(ext)s" \
-            "$VIDEO_URL"
+            -o "download.%(ext)s" \
+            "$VIDEO_URL" || {
+              echo "::error::Download failed. YouTube may require authentication or may be temporarily blocking automated downloads. This workflow does not bypass sign-in restrictions."
+              exit 1
+            }
 
           SOURCE=$(find . -maxdepth 1 -type f \
-            -name 'source.*' \
-            ! -name '*.part' | head -n 1)
+            -name 'download.*' ! -name '*.part' \
+            ! -name '*.json' -print -quit)
 
-          if [ -z "$SOURCE" ]; then
-            echo "Video download failed."
+          if [ -z "$SOURCE" ] || [ ! -s "$SOURCE" ]; then
+            echo "::error::No downloaded video file was found."
             exit 1
           fi
 
           mv "$SOURCE" source.mp4
+
+          ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 source.mp4
+
+      - name: Validate clip settings
+        env:
+          CLIP_COUNT: ${{ inputs.clip_count }}
+          CLIP_DURATION: ${{ inputs.clip_duration }}
+        run: |
+          python - <<'PY'
+          import os
+
+          count = int(os.environ["CLIP_COUNT"])
+          duration = int(os.environ["CLIP_DURATION"])
+
+          if not 1 <= count <= 5:
+              raise SystemExit("Choose between 1 and 5 clips.")
+
+          if not 15 <= duration <= 60:
+              raise SystemExit("Choose a duration between 15 and 60 seconds.")
+          PY
 
       - name: Create vertical clips
         env:
@@ -64,27 +126,25 @@ jobs:
           CLIP_DURATION: ${{ inputs.clip_duration }}
         run: |
           set -euo pipefail
-
-          [[ "$CLIP_COUNT" =~ ^[1-5]$ ]] || {
-            echo "Clip count must be 1-5."
-            exit 1
-          }
-
-          [[ "$CLIP_DURATION" =~ ^(15|[1-5][0-9]|60)$ ]] || {
-            echo "Clip duration must be 15-60 seconds."
-            exit 1
-          }
-
           mkdir -p clips
 
           TOTAL=$(ffprobe -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 source.mp4)
 
-          python -c 'import sys; assert float(sys.argv[1]) > 0' "$TOTAL"
+          python - "$TOTAL" "$CLIP_DURATION" <<'PY'
+          import sys
+
+          total, length = map(float, sys.argv[1:])
+          if total < length:
+              raise SystemExit(
+                  "The source video is shorter than the requested clip duration."
+              )
+          PY
 
           for i in $(seq 1 "$CLIP_COUNT"); do
-            START=$(python - "$TOTAL" "$CLIP_DURATION" "$i" "$CLIP_COUNT" <<'PY'
+            START=$(python - "$TOTAL" "$CLIP_DURATION" \
+              "$i" "$CLIP_COUNT" <<'PY'
           import sys
           total, length, index, count = map(float, sys.argv[1:])
           available = max(0, total - length)
@@ -95,9 +155,12 @@ jobs:
             ffmpeg -hide_banner -loglevel error -y \
               -ss "$START" -i source.mp4 \
               -t "$CLIP_DURATION" \
+              -map 0:v:0 -map '0:a?' \
               -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
-              -an -c:v libx264 -preset ultrafast -crf 24 \
+              -c:v libx264 -preset ultrafast -crf 24 \
               -pix_fmt yuv420p \
+              -c:a aac -b:a 128k \
+              -movflags +faststart \
               "clips/clip-${i}.mp4"
 
             test -s "clips/clip-${i}.mp4"
@@ -108,5 +171,6 @@ jobs:
         with:
           name: clipforge-clips
           path: clips/*.mp4
+          if-no-files-found: error
           retention-days: 3
           
